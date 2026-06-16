@@ -1,0 +1,335 @@
+version: "3.9"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CixioHub — Full Local Development Stack
+#
+# QUICK START (infra only — recommended for development):
+#   docker compose up -d
+#
+# FULL STACK (all services including app code):
+#   docker compose --profile full up -d
+#
+# STOP:   docker compose down
+# LOGS:   docker compose logs -f <service>
+# STATUS: docker compose ps
+#
+# After first start, pull Ollama models:
+#   docker exec cixiohub-ollama ollama pull llama3.2:3b
+#   docker exec cixiohub-ollama ollama pull nomic-embed-text
+# ═══════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ══════════════════════════════════════════════════════════════════
+  # DATABASE TIER
+  # ══════════════════════════════════════════════════════════════════
+
+  # PostgreSQL 16 + pgvector — primary relational database
+  # Local:      postgresql://localhost:5432/cixiohub
+  # Production: AWS RDS (internal only)
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: cixiohub-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cixiohub}
+      POSTGRES_USER: ${POSTGRES_USER:-cixiohub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cixiohub}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cixiohub"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # MongoDB 7 — document store (audit logs, analytics, flexible schemas)
+  # Local:      mongodb://localhost:27017/cixiohub
+  # Production: MongoDB Atlas (internal only)
+  # Compass:    mongodb://cixiohub:cixiohub@localhost:27017
+  mongodb:
+    image: mongo:7
+    container_name: cixiohub-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-cixiohub}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-cixiohub}
+      MONGO_INITDB_DATABASE: ${MONGO_INITDB_DATABASE:-cixiohub}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ══════════════════════════════════════════════════════════════════
+  # CACHE & SESSION TIER
+  # ══════════════════════════════════════════════════════════════════
+
+  # Redis 7 — cache, session store, rate limiting, pub/sub
+  # Local:      redis://localhost:6379
+  # Production: AWS ElastiCache (internal only)
+  redis:
+    image: redis:7-alpine
+    container_name: cixiohub-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ══════════════════════════════════════════════════════════════════
+  # MESSAGE QUEUE TIER
+  # ══════════════════════════════════════════════════════════════════
+
+  # RabbitMQ 3 — async task queue (email, SMS, push, bulk notifications)
+  # AMQP:          amqp://localhost:5672
+  # Management UI: http://localhost:15672   (guest / guest)
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: cixiohub-rabbitmq
+    ports:
+      - "5672:5672"    # AMQP protocol
+      - "15672:15672"  # Management web UI
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # Mosquitto 2 — MQTT broker (real-time events for mobile / IoT)
+  # MQTT:          mqtt://localhost:1883
+  # MQTT over WS:  ws://localhost:9883
+  # Flutter:       connect via MqttServerClient on port 1883
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: cixiohub-mosquitto
+    ports:
+      - "1883:1883"  # MQTT
+      - "9883:9883"  # MQTT over WebSocket
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    restart: unless-stopped
+
+  # ══════════════════════════════════════════════════════════════════
+  # OBJECT STORAGE
+  # ══════════════════════════════════════════════════════════════════
+
+  # MinIO — S3-compatible object storage (replaces AWS S3 in development)
+  # S3 API:        http://localhost:9000   (minioadmin / minioadmin)
+  # Web Console:   http://localhost:9001
+  # Bucket: cixiohub-uploads (create in console on first start)
+  minio:
+    image: minio/minio:latest
+    container_name: cixiohub-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # Web console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ══════════════════════════════════════════════════════════════════
+  # AI / VECTOR TIER
+  # ══════════════════════════════════════════════════════════════════
+
+  # ChromaDB — vector store for RAG document search
+  # Local:      http://localhost:8002
+  # Production: internal only
+  chromadb:
+    image: chromadb/chroma:1.0.0
+    container_name: cixiohub-chromadb
+    ports:
+      - "8002:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+    restart: unless-stopped
+
+  # Ollama — local LLM / embedding server
+  # Local:      http://localhost:11434
+  # Production: internal only (GPU server or cloud API)
+  # After start: docker exec cixiohub-ollama ollama pull llama3.2:3b
+  #              docker exec cixiohub-ollama ollama pull nomic-embed-text
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cixiohub-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    # Uncomment for NVIDIA GPU support:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # ══════════════════════════════════════════════════════════════════
+  # DEV UTILITIES (always available in local dev)
+  # ══════════════════════════════════════════════════════════════════
+
+  # MailHog — catches all outgoing email; nothing actually gets sent
+  # SMTP:    smtp://localhost:1025  (use this as SMTP host in .env)
+  # Web UI:  http://localhost:8025
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: cixiohub-mailhog
+    ports:
+      - "1025:1025"  # SMTP
+      - "8025:8025"  # Web UI
+    restart: unless-stopped
+
+  # ══════════════════════════════════════════════════════════════════
+  # APPLICATION SERVICES  (docker compose --profile full up)
+  #
+  # These run OUTSIDE Docker by default (faster hot-reload).
+  # Uncomment and use `--profile full` to run everything in Docker.
+  # ══════════════════════════════════════════════════════════════════
+
+  # Backend — FastAPI on :8000
+  # Local dev:   http://localhost:8000
+  # Swagger UI:  http://localhost:8000/docs
+  # backend:
+  #   build: ../backend
+  #   container_name: cixiohub-backend
+  #   ports:
+  #     - "8000:8000"
+  #   env_file: ../backend/.env
+  #   environment:
+  #     DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cixiohub}:${POSTGRES_PASSWORD:-cixiohub}@postgres:5432/${POSTGRES_DB:-cixiohub}
+  #     MONGODB_URL: mongodb://${MONGO_ROOT_USER:-cixiohub}:${MONGO_ROOT_PASSWORD:-cixiohub}@mongodb:27017/${MONGO_INITDB_DATABASE:-cixiohub}
+  #     REDIS_URL: redis://redis:6379/0 # No credentials for local Redis
+  #     RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672/
+  #     AI_SERVICE_URL: http://ai:8003
+  #     AWS_ENDPOINT_URL: http://minio:9000 # For local S3 (MinIO)
+  #     SMTP_HOST: mailhog
+  #     SMTP_PORT: 1025
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     mongodb:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #     rabbitmq:
+  #       condition: service_healthy
+  #     minio:
+  #       condition: service_healthy
+  #   profiles: ["full"]
+
+  # AI Service — FastAPI on :8003 (LLM + RAG + document extraction)
+  # Local dev:   http://localhost:8003
+  # Health:      http://localhost:8003/health
+  # ai:
+  #   build: ../../CixioHub-AI
+  #   container_name: cixiohub-ai
+  #   ports:
+  #     - "8003:8003"
+  #   env_file: ../../CixioHub-AI/.env
+  #   environment:
+  #     OLLAMA_BASE_URL: http://ollama:11434
+  #     CHROMA_HOST: chromadb
+  #     CHROMA_PORT: 8000
+  #   depends_on:
+  #     chromadb:
+  #       condition: service_started
+  #     ollama:
+  #       condition: service_started
+  #   profiles: ["full"]
+
+  # Notify Service — FastAPI on :8001
+  # Local dev:   http://localhost:8001
+  # Health:      http://localhost:8001/health
+
+  # notify:
+  #   build: ../notify
+  #   container_name: cixiohub-notify
+  #   ports:
+  #     - "8001:8001"
+  #   env_file: ../notify/.env
+  #   environment:
+  #     DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cixiohub}:${POSTGRES_PASSWORD:-cixiohub}@postgres:5432/${POSTGRES_DB:-cixiohub}
+  #     RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-guest}:${RABBITMQ_DEFAULT_PASS:-guest}@rabbitmq:5672/
+  #     SMTP_HOST: mailhog
+  #     SMTP_PORT: 1025
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     rabbitmq:
+  #       condition: service_healthy
+  #   profiles: ["full"]
+
+  # Frontend — Next.js on :3000
+  # Local dev:   http://localhost:3000
+
+  # frontend:
+  #   build: ../frontend
+  #   container_name: cixiohub-frontend
+  #   ports:
+  #     - "3000:3000"
+  #   env_file: ../frontend/.env.local
+  #   environment:
+  #     NEXT_PUBLIC_API_URL: http://backend:8000
+  #   profiles: ["full"]
+
+  # Nginx — reverse proxy (path-based local, subdomain-based production)
+  # Local:       http://localhost      → frontend:3000
+  #              http://localhost/api/ → backend:8000
+
+  # nginx:
+  #   build: ./nginx
+  #   container_name: cixiohub-nginx
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   depends_on:
+  #     - backend
+  #     - frontend
+  #     - ai
+  #     - notify
+  #   profiles: ["full"]
+
+volumes:
+  postgres_data:
+  mongo_data:
+  redis_data:
+  rabbitmq_data:
+  mosquitto_data:
+  mosquitto_log:
+  minio_data:
+  chroma_data:
+  ollama_data:

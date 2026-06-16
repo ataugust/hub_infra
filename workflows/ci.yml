@@ -15,9 +15,9 @@ jobs:
       postgres:
         image: pgvector/pgvector:pg16
         env:
-          POSTGRES_DB: cixiohub_test
-          POSTGRES_USER: cixiohub
-          POSTGRES_PASSWORD: cixiohub
+          POSTGRES_DB: 
+          POSTGRES_USER: 
+          POSTGRES_PASSWORD: 
         ports:
           - 5432:5432
         options: >-
